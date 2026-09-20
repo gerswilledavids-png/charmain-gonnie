@@ -1,0 +1,210 @@
+/**
+ * Gonnie Fleet — Trip Capture backend
+ * Links the "Gonnie Fleet — Trip Capture" HTML form to this spreadsheet.
+ *
+ * Finds sheets/columns by HEADER NAME rather than hardcoded letters, so it
+ * keeps working if columns get reordered or new ones get added later.
+ *
+ * SETUP:
+ * 1. Open the spreadsheet → Extensions → Apps Script
+ * 2. Delete whatever is in Code.gs, paste this in, save
+ * 3. Deploy → New deployment → type "Web app"
+ *      - Execute as: Me
+ *      - Who has access: Anyone
+ * 4. Copy the resulting /exec URL and paste it into API_URL in the HTML file
+ * 5. IMPORTANT: log one test trip first and check the row in Trip_Log looks
+ *    right before relying on this for real trips.
+ */
+ 
+// ── If your driver list tab isn't found automatically, hardcode its exact
+// tab name here (case-sensitive), e.g. 'Driver_Register'.
+var DRIVER_SHEET_NAME_OVERRIDE = '';
+ 
+// Form field → Trip_Log column header (must match the header text exactly,
+// aside from trimming). Only these columns get overwritten on a new trip —
+// every other column is left as copied down from the row above (formulas,
+// lookups, etc. keep working untouched).
+var FIELD_TO_HEADER = {
+  date:                  'Date',
+  fleet_no:              'Fleet No',
+  registration:          'Registration',
+  driver_name:           'Driver Name',
+  driver_phone:          'Driver Phone',
+  odo_start:             'Odo Start',
+  odo_end:               'Odo End',
+  fuel_used_l:           'Fuel Used (L)',
+  cost_per_liter:        'Cost/Liter (R)',
+  fill_type:             'Fill Type',
+  fuel_filled_return_l:  'Fuel Filled on Return (L)',
+  start_destination:     'START DESTINATION',
+  end_destination:       'END DESTINATION',
+  cargo_type:            'Cargo Type',
+  load_kg:               'Load KG',
+  fuel_station:          'Fuel Station',
+  revenue:               'Revenue (R)',
+  customer:              'Customer',
+  manager:               'Manager',
+  manager_phone:         'Manager Phone',
+  notes:                 'Trip Notes'
+};
+ 
+// ── Helpers ─────────────────────────────────────────────────────────────
+ 
+// Scans every sheet's first 20 rows for a row that contains ALL of
+// requiredHeaders (exact match after trimming). Returns the sheet, that
+// row's number, and a {headerText -> columnIndex(1-based)} map, or null.
+function findSheetByHeaders(requiredHeaders) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheets = ss.getSheets();
+  for (var s = 0; s < sheets.length; s++) {
+    var sheet = sheets[s];
+    var lastCol = sheet.getLastColumn();
+    if (lastCol < 1) continue;
+    var scanRows = Math.min(20, sheet.getLastRow());
+    for (var r = 1; r <= scanRows; r++) {
+      var rowVals = sheet.getRange(r, 1, 1, lastCol).getValues()[0];
+      var map = {};
+      for (var c = 0; c < rowVals.length; c++) {
+        var h = String(rowVals[c]).trim();
+        if (h) map[h] = c + 1;
+      }
+      var hasAll = requiredHeaders.every(function (h) { return map.hasOwnProperty(h); });
+      if (hasAll) {
+        return { sheet: sheet, headerRow: r, headers: map };
+      }
+    }
+  }
+  return null;
+}
+ 
+function jsonOut(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+ 
+// ── doPost: log a new trip ─────────────────────────────────────────────
+ 
+function doPost(e) {
+  try {
+    var data = JSON.parse(e.postData.contents);
+ 
+    var found = findSheetByHeaders(['Trip ID', 'Odo Start', 'Driver Name']);
+    if (!found) throw new Error("Could not find the Trip_Log tab (looked for headers 'Trip ID', 'Odo Start', 'Driver Name').");
+    var sheet = found.sheet, headers = found.headers, headerRow = found.headerRow;
+    var lastCol = sheet.getLastColumn();
+ 
+    var lastRow = sheet.getLastRow();
+    var newRow = lastRow + 1;
+ 
+    // Copy the row above's formulas/formatting down so every calculated
+    // column keeps working. Skip this on the very first data row.
+    if (lastRow > headerRow) {
+      sheet.getRange(lastRow, 1, 1, lastCol)
+        .copyTo(sheet.getRange(newRow, 1, 1, lastCol));
+    }
+ 
+    // Trip ID: increment from the last numeric ID in that column.
+    var tripIdCol = headers['Trip ID'];
+    var tripId = 1;
+    if (lastRow > headerRow) {
+      var lastId = Number(sheet.getRange(lastRow, tripIdCol).getValue());
+      if (!isNaN(lastId) && lastId >= 1) tripId = lastId + 1;
+    }
+    sheet.getRange(newRow, tripIdCol).setValue(tripId);
+ 
+    // Write each submitted field into its matching column, by header name.
+    for (var field in FIELD_TO_HEADER) {
+      var headerName = FIELD_TO_HEADER[field];
+      var col = headers[headerName];
+      if (!col) continue; // header not found on this sheet — skip safely
+      var val = data[field];
+      if (val === undefined || val === null || val === '') continue; // leave blank fields untouched
+      if (field === 'date') {
+        sheet.getRange(newRow, col).setValue(val ? new Date(val) : new Date());
+      } else if (['odo_start', 'odo_end', 'fuel_used_l', 'cost_per_liter',
+                  'fuel_filled_return_l', 'load_kg', 'revenue'].indexOf(field) !== -1) {
+        sheet.getRange(newRow, col).setValue(Number(val) || 0);
+      } else {
+        sheet.getRange(newRow, col).setValue(val);
+      }
+    }
+ 
+    // New trips start unpaid — override whatever "Paid Status" got copied down.
+    if (headers['Paid Status']) {
+      sheet.getRange(newRow, headers['Paid Status']).setValue('Pending');
+    }
+ 
+    return jsonOut({ status: 'success', trip_id: tripId, message: 'Trip logged to Trip_Log' });
+ 
+  } catch (err) {
+    return jsonOut({ status: 'error', message: err.toString() });
+  }
+}
+ 
+// ── doGet: vehicles / drivers dropdowns ────────────────────────────────
+ 
+function doGet(e) {
+  try {
+    var action = (e && e.parameter) ? e.parameter.action : '';
+ 
+    if (action === 'vehicles') {
+      var found = findSheetByHeaders(['Registration', 'Make', 'Model']);
+      if (!found) return jsonOut({ vehicles: [], error: 'Vehicle_Register tab not found' });
+      var sheet = found.sheet, h = found.headers, headerRow = found.headerRow;
+      var lastRow = sheet.getLastRow();
+      var vehicles = [];
+      for (var r = headerRow + 1; r <= lastRow; r++) {
+        var reg = sheet.getRange(r, h['Registration']).getValue();
+        if (!reg) continue;
+        vehicles.push({
+          registration: reg,
+          make: h['Make'] ? sheet.getRange(r, h['Make']).getValue() : '',
+          model: h['Model'] ? sheet.getRange(r, h['Model']).getValue() : '',
+          expected_kml: h['Expected KM/L'] ? sheet.getRange(r, h['Expected KM/L']).getValue() : '',
+          current_odometer: h['Current Odometer'] ? sheet.getRange(r, h['Current Odometer']).getValue() : ''
+        });
+      }
+      return jsonOut({ vehicles: vehicles });
+    }
+ 
+    if (action === 'drivers') {
+      var found2;
+      if (DRIVER_SHEET_NAME_OVERRIDE) {
+        var ss = SpreadsheetApp.getActiveSpreadsheet();
+        var sh = ss.getSheetByName(DRIVER_SHEET_NAME_OVERRIDE);
+        if (sh) {
+          var lastCol = sh.getLastColumn();
+          var headerVals = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+          var hmap = {};
+          for (var c = 0; c < headerVals.length; c++) {
+            var hh = String(headerVals[c]).trim();
+            if (hh) hmap[hh] = c + 1;
+          }
+          found2 = { sheet: sh, headerRow: 1, headers: hmap };
+        }
+      }
+      if (!found2) found2 = findSheetByHeaders(['Driver Name', 'Phone']);
+      if (!found2) return jsonOut({ drivers: [], error: 'Driver_Register tab not found — set DRIVER_SHEET_NAME_OVERRIDE at the top of this script.' });
+ 
+      var sheet2 = found2.sheet, h2 = found2.headers, headerRow2 = found2.headerRow;
+      var lastRow2 = sheet2.getLastRow();
+      var drivers = [];
+      for (var r2 = headerRow2 + 1; r2 <= lastRow2; r2++) {
+        var name = sheet2.getRange(r2, h2['Driver Name']).getValue();
+        if (!name) continue;
+        drivers.push({
+          driver_name: name,
+          phone: h2['Phone'] ? sheet2.getRange(r2, h2['Phone']).getValue() : ''
+        });
+      }
+      return jsonOut({ drivers: drivers });
+    }
+ 
+    return jsonOut({ status: 'error', message: 'Unknown action: ' + action });
+ 
+  } catch (err) {
+    return jsonOut({ status: 'error', message: err.toString() });
+  }
+}
+ 
+
